@@ -27,6 +27,7 @@ class Policy(nn.Module):
         super(Policy, self).__init__()
 
 
+        # region Action Space Configuration
         # Determine whether output distribution is to be Discrete (--> Multinomial) or Continuous (--> Gaussian)
         self.dist_type = dist_type
         # NOTE!
@@ -39,8 +40,10 @@ class Policy(nn.Module):
         else:
             # Assumption: no flattening needed!
             self.num_actions = action_space.shape[0]
+        # endregion
 
 
+        # region Standard Deviation Configuration
         # Set a flag indicating whether std is supposed to be trainable rather than a constant or to be annealed instead
         self.std_trainable = is_provided(standard_dev) and is_trainable(standard_dev)
 
@@ -54,8 +57,10 @@ class Policy(nn.Module):
         else:
             # If standard deviation is trainable, we don't need a scheduler for it
             self.std = None
+        # endregion
 
 
+        # region Network Architecture
         # Assign input layer possibly consisting of multiple internal layers; Design dependent on nature of state observations
         if input_net_type.lower() == 'cnn' or input_net_type.lower() == 'visual':
             # Create CNN to encode inputs
@@ -92,6 +97,7 @@ class Policy(nn.Module):
             self.input_module,
             self.output_module
         ]
+        # endregion
 
         # To be assigned later (during execution). Will contain parameterized distribution (one per parallel agent)
         self.dist = None

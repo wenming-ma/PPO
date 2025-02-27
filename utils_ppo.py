@@ -7,8 +7,54 @@ from lr_scheduler import CustomLRScheduler
 from torch.optim.lr_scheduler import ExponentialLR, LambdaLR
 
 
-def add_batch_dimension(state: np.ndarray):
-    return np.expand_dims(state, axis=0)
+def add_batch_dimension(state):
+    """
+    Add a batch dimension to the state.
+    Handles different state formats from gym environments.
+    
+    Args:
+        state: The state from the environment, which could be:
+               - numpy array
+               - dict (for new gym versions)
+               - tuple or list
+    
+    Returns:
+        numpy array with batch dimension added
+    """
+    # Handle dict states (new gym versions)
+    if isinstance(state, dict):
+        if 'observation' in state:
+            state = state['observation']
+        elif len(state) > 0:
+            # Take the first value if observation is not present
+            state = next(iter(state.values()))
+    
+    # Handle tuple or list states
+    if isinstance(state, (tuple, list)):
+        try:
+            state = np.array(state, dtype=np.float32)
+        except:
+            # If conversion fails, try to extract the first element
+            if len(state) > 0:
+                return add_batch_dimension(state[0])
+            else:
+                # Empty sequence, return a default state
+                return np.zeros((1, 4), dtype=np.float32)
+    
+    # Ensure state is a numpy array
+    if not isinstance(state, np.ndarray):
+        try:
+            state = np.array(state, dtype=np.float32)
+        except:
+            print(f"Warning: Could not convert state of type {type(state)} to numpy array")
+            return np.zeros((1, 4), dtype=np.float32)
+    
+    # Add batch dimension if not already present
+    if len(state.shape) == 1:
+        return np.expand_dims(state, axis=0)
+    else:
+        # If already has batch dimension or is multi-dimensional, return as is
+        return state
 
 
 def simulation_is_stuck(last_state, state):

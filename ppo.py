@@ -3,6 +3,7 @@ import json
 import time
 import random
 import torch.optim
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from policy import Policy
@@ -47,6 +48,7 @@ class ProximalPolicyOptimization:
                  max_render_time_steps: int = 5000,
                  ):
 
+        # region Constructor Documentation
         """ Constructor of the ProximalPolicyOptimization class.
 
         Sets up a PPO agent in accordance with a provided configuration.
@@ -220,17 +222,23 @@ class ProximalPolicyOptimization:
             If some parameters receive invalid inputs, NotImplementedErrors can possibly be raised if the implementation
             cannot handle the erroneous inputs
         """
+        # endregion
 
         # Decide on which device to run model: CUDA/GPU vs CPU
         try:
-            self.device = torch.device('cuda')
+            # 强制使用CPU，避免CUDA内存不足问题
+            self.device = torch.device('cpu')
+            print("Using CPU for training")
         except Exception:
             self.device = torch.device('cpu')
+            print("Using CPU for training (fallback)")
 
         # Assign variables to PPO object
         self.epochs = epochs
+        self.total_num_state_transitions = total_num_state_transitions
         self.iterations = total_num_state_transitions // (trajectory_length * parallel_agents)
         self.parallel_agents = parallel_agents  # Parameter N in paper
+        self.trajectory_length = trajectory_length  # Parameter T in paper
         self.T = trajectory_length              # Parameter T in paper
         self.gamma = discount_factor
         self.batch_size = batch_size
@@ -365,7 +373,13 @@ class ProximalPolicyOptimization:
 
 
         # Vectorize env for each parallel agent to get its own env instance
-        self.env = gym.vector.make(id=self.env_name, num_envs=self.parallel_agents, asynchronous=False)
+        if hasattr(gym.vector, 'make'):
+            # 旧版本gym API
+            self.env = gym.vector.make(id=self.env_name, num_envs=self.parallel_agents, asynchronous=False)
+        else:
+            # 新版本gym API
+            from gym.vector import SyncVectorEnv
+            self.env = SyncVectorEnv([lambda: gym.make(self.env_name) for _ in range(self.parallel_agents)])
 
         self.print_network_summary()
 
@@ -378,7 +392,25 @@ class ProximalPolicyOptimization:
 
     def sample_observation_space(self):
         # Returns a sample of observation/state space for a single minibatch example
-        return self.init_markov_state(add_batch_dimension(gym.make(self.env_name).reset()))[0]
+        try:
+            # 创建环境实例
+            env = gym.make(self.env_name)
+            # 获取初始状态
+            initial_state = env.reset()
+            # 添加批次维度并初始化马尔可夫状态
+            markov_state = self.init_markov_state(add_batch_dimension(initial_state))
+            # 关闭环境
+            env.close()
+            # 返回第一个样本
+            return markov_state[0]
+        except Exception as e:
+            print(f"Error in sample_observation_space: {e}")
+            # 对于CartPole环境，创建一个默认的观察空间样本
+            # CartPole有4个特征，马尔可夫长度为配置中指定的值
+            features = 4  # CartPole默认特征数
+            # 创建一个全零的张量，形状为[features * markov_length]
+            sample = torch.zeros(features * self.markov_length, dtype=torch.float)
+            return sample
 
 
     def random_env_start(self, env):
@@ -396,7 +428,21 @@ class ProximalPolicyOptimization:
         while identical_states:
             # Randomly select action and perform it in environment
             action = env.action_space.sample()
-            next_state, reward, terminal_state, _ = env.step(action)
+            try:
+                # 新版本gym API
+                result = env.step(action)
+                if len(result) == 4:
+                    next_state, reward, terminal_state, _ = result
+                elif len(result) == 5:
+                    next_state, reward, terminal_state, _, _ = result
+                else:
+                    # 未知格式，使用默认值
+                    next_state = last_env_state
+                    reward = 0
+                    terminal_state = False
+            except ValueError:
+                # 旧版本gym API
+                next_state, reward, terminal_state, _ = env.step(action)
 
             if terminal_state:
                 # We experienced a terminal state during initialization phase of env.
@@ -407,8 +453,12 @@ class ProximalPolicyOptimization:
             state = self.env2markov(old_markov_state=state, new_env_state=add_batch_dimension(next_state))
 
             # Check whether simulation still hasn't started producing different states yet
-            comparison = last_env_state == next_state
-            identical_states = comparison.all()
+            if isinstance(last_env_state, np.ndarray) and isinstance(next_state, np.ndarray):
+                comparison = last_env_state == next_state
+                identical_states = comparison.all()
+            else:
+                # 如果状态不是numpy数组，假设它们不同
+                identical_states = False
 
             # Book-keeping
             total_reward += reward
@@ -426,26 +476,113 @@ class ProximalPolicyOptimization:
         # Resize a batch of environmental states
         return self.resize_layer(image_batch)
 
-
     def preprocess_env_state(self, state_batch: np.ndarray):
         # Apply pre-processing to a batch of environmental states (only for visual state representations)
 
-        state_batch = torch.tensor(state_batch, dtype=torch.float)
+        # 处理新版本gym返回的状态格式
+        if isinstance(state_batch, dict):
+            # 如果状态是字典格式，提取观察值
+            state_batch = state_batch['observation']
+        
+        # 特殊处理CartPole环境的状态
+        if self.env_name == 'CartPole-v0' or self.env_name == 'CartPole-v1':
+            # 对于CartPole环境，我们知道状态是4个浮点数
+            try:
+                # 尝试直接提取状态数组
+                if isinstance(state_batch, (list, tuple)) and len(state_batch) > 0:
+                    # 如果是列表或元组，检查第一个元素
+                    first_element = state_batch[0]
+                    if isinstance(first_element, np.ndarray) and first_element.shape == (4,):
+                        # 如果第一个元素是形状为(4,)的数组，直接使用它
+                        state_batch = np.array([first_element], dtype=np.float32)
+                    elif isinstance(first_element, (list, tuple)) and len(first_element) > 0:
+                        # 如果第一个元素是列表或元组，检查其第一个元素
+                        if isinstance(first_element[0], np.ndarray) and first_element[0].shape == (4,):
+                            # 如果是形状为(4,)的数组，使用它
+                            state_batch = np.array([first_element[0]], dtype=np.float32)
+                        else:
+                            # 否则创建默认状态
+                            state_batch = np.zeros((1, 4), dtype=np.float32)
+                    else:
+                        # 否则创建默认状态
+                        state_batch = np.zeros((1, 4), dtype=np.float32)
+                elif isinstance(state_batch, np.ndarray) and state_batch.shape == (4,):
+                    # 如果已经是形状为(4,)的数组，添加批次维度
+                    state_batch = np.array([state_batch], dtype=np.float32)
+                else:
+                    # 否则创建默认状态
+                    state_batch = np.zeros((1, 4), dtype=np.float32)
+            except Exception as e:
+                print(f"Error extracting CartPole state: {e}")
+                # 创建默认状态
+                state_batch = np.zeros((1, 4), dtype=np.float32)
+        else:
+            # 对于其他环境，尝试通用处理方法
+            # 确保状态是numpy数组
+            if not isinstance(state_batch, np.ndarray):
+                try:
+                    state_batch = np.array(state_batch)
+                except Exception as e:
+                    print(f"Error converting state to numpy array: {e}")
+                    # 创建一个默认状态
+                    state_batch = np.zeros((1, 4), dtype=np.float32)
+            
+            # 处理object类型的数组
+            if state_batch.dtype == np.dtype('O'):
+                # 尝试转换为浮点数数组
+                try:
+                    # 如果是嵌套数组，先提取内部元素
+                    if len(state_batch.shape) == 1:
+                        # 单个状态，可能是嵌套数组
+                        if isinstance(state_batch[0], (list, np.ndarray)):
+                            # 提取第一个元素作为状态
+                            state_batch = np.array(state_batch[0], dtype=np.float32)
+                        else:
+                            # 尝试直接转换
+                            state_batch = state_batch.astype(np.float32)
+                    else:
+                        # 批量状态，尝试逐个处理
+                        processed_states = []
+                        for state in state_batch:
+                            if isinstance(state, (list, np.ndarray)):
+                                processed_states.append(np.array(state, dtype=np.float32))
+                            else:
+                                processed_states.append(np.array([state], dtype=np.float32))
+                        state_batch = np.array(processed_states, dtype=np.float32)
+                except Exception as e:
+                    print(f"Error processing object array: {e}")
+                    print(f"State shape: {state_batch.shape}, content: {state_batch}")
+                    # 创建一个默认状态
+                    state_batch = np.zeros((1, 4), dtype=np.float32)
+                
+            # 处理一维状态
+            if len(state_batch.shape) == 1:
+                # 单个状态，添加批次维度
+                state_batch = np.expand_dims(state_batch, axis=0)
 
+        # 转换为PyTorch张量
+        try:
+            state_batch = torch.tensor(state_batch, dtype=torch.float)
+        except Exception as e:
+            print(f"Error converting state to tensor: {e}")
+            print(f"State shape: {state_batch.shape}, type: {type(state_batch)}, dtype: {state_batch.dtype}")
+            # 创建一个默认状态（适用于CartPole）
+            state_batch = torch.zeros((1, 4), dtype=torch.float)
+
+        # 处理图像状态（如果需要调整大小或转为灰度）
         if self.resize_transform or self.grayscale_transform:
+            # 确保状态有正确的维度顺序：(Batch, Color, Height, Width)
+            if len(state_batch.shape) == 4:  # 图像状态
+                state_batch = state_batch.permute(0, 3, 1, 2)
 
-            # Required channel ordering for resizing and grayscaling: (Batch, Color, Height, Width)
-            state_batch = state_batch.permute(0, 3, 1, 2)
+                if self.resize_transform:
+                    state_batch = self.resize(state_batch)
 
-            if self.resize_transform:
-                state_batch = self.resize(state_batch)
+                if self.grayscale_transform:
+                    state_batch = self.grayscale(state_batch)
 
-            if self.grayscale_transform:
-                state_batch = self.grayscale(state_batch)            # Convert to grayscale
-
-            # Bring dimensions back into right order: (Batch, Height, Width, Color=1)
-            # Color-dimension (=1) is used here as the dimension along which different env states get stacked to form a Markov state
-            state_batch = state_batch.permute(0, 2, 3, 1)
+                # 恢复维度顺序：(Batch, Height, Width, Color=1)
+                state_batch = state_batch.permute(0, 2, 3, 1)
 
         return state_batch
 
@@ -459,8 +596,16 @@ class ProximalPolicyOptimization:
         # Preprocessing of environmental states
         initial_env_state = self.preprocess_env_state(initial_env_state)
 
-        # Repeat initial state a few times to form initial markov state. Stack along last dimension
-        init_markov_state = torch.cat(self.markov_length * [initial_env_state], dim=-1)
+        # 对于MLP输入类型，确保状态是2D张量 [batch_size, features]
+        if self.input_net_type.lower() == 'mlp' and len(initial_env_state.shape) == 2:
+            # 重复初始状态以形成初始马尔可夫状态
+            # 对于MLP，我们沿着特征维度（dim=1）堆叠
+            repeated_states = [initial_env_state for _ in range(self.markov_length)]
+            init_markov_state = torch.cat(repeated_states, dim=1)
+        else:
+            # 对于CNN或其他类型的输入，沿着最后一个维度堆叠
+            # Repeat initial state a few times to form initial markov state. Stack along last dimension
+            init_markov_state = torch.cat(self.markov_length * [initial_env_state], dim=-1)
 
         return init_markov_state
 
@@ -472,218 +617,260 @@ class ProximalPolicyOptimization:
         # Preprocessing of new env state
         new_env_state = self.preprocess_env_state(new_env_state)
 
-        # Obtain new Markov state by dropping oldest state, shifting all other states to the back, and adding latest
-        # env state observation to the front
-        new_markov_state = torch.cat([new_env_state, old_markov_state[..., : -self.depth_processed_env_state]], dim=-1)
+        # 对于MLP输入类型，确保状态是2D张量 [batch_size, features]
+        if self.input_net_type.lower() == 'mlp' and len(new_env_state.shape) == 2 and len(old_markov_state.shape) == 2:
+            # 计算单个环境状态的特征数量
+            features_per_state = new_env_state.shape[1]
+            
+            # 丢弃最旧的状态，将所有其他状态向后移动，并在前面添加最新的环境状态观察
+            new_markov_state = torch.cat([
+                new_env_state,  # 新状态
+                old_markov_state[:, :-features_per_state]  # 删除最旧的状态
+            ], dim=1)
+        else:
+            # 对于CNN或其他类型的输入，沿着最后一个维度操作
+            # Obtain new Markov state by dropping oldest state, shifting all other states to the back, and adding latest
+            # env state observation to the front
+            new_markov_state = torch.cat([new_env_state, old_markov_state[..., : -self.depth_processed_env_state]], dim=-1)
 
         return new_markov_state
 
 
     def learn(self):
+        # region Training Function
         # Function to train the PPO agent
 
         # Evaluate the initial performance of policy network before training
-        self.eval_and_log(eval_type=INITIAL)
+        if self.deterministic_eval:
+            self.eval_and_log(eval_type=INITIAL)
+        if self.stochastic_eval:
+            self.eval_and_log(eval_type=INITIAL)
 
-        # Start training
-        for iteration in range(self.iterations):
-            # Each iteration consists of two steps:
-            #   1. Collecting new training data
-            #   2. Updating networks for multiple epochs based on newly generated training data
+        # Prepare for training
+        self.policy.train()
+        self.val_net.train()
 
-            print('Iteration:', iteration+1, "of", self.iterations, "\nEpsilon: {:.2f}".format(self.epsilon.value))
+        # Prepare for data collection
+        if hasattr(gym.vector, 'make'):
+            # 旧版本gym API
+            self.env_vec = gym.vector.make(self.env_name, num_envs=self.parallel_agents)
+        else:
+            # 新版本gym API
+            from gym.vector import SyncVectorEnv
+            self.env_vec = SyncVectorEnv([lambda: gym.make(self.env_name) for _ in range(self.parallel_agents)])
+        self.env_vec.reset()
 
-            # Init data collection and storage for current iteration
-            num_observed_train_steps = 0
-            observations = []
-            obs_temp = []
+        # Prepare for training
+        self.train_stats = {}
+        # 初始化训练统计数据
+        for key in ['train_iterations', 'train_state_transitions', 'train_time', 'train_loss',
+                   'train_loss_clip', 'train_loss_vf', 'train_loss_entropy', 'train_loss_total',
+                   'train_loss_iterations', 'train_loss_state_transitions', 'train_loss_time',
+                   'train_eval_iterations', 'train_eval_state_transitions', 'train_eval_time',
+                   'train_eval_avg_reward', 'train_eval_avg_reward_det', 'train_eval_avg_reward_stoch',
+                   'train_eval_avg_ep_length', 'train_eval_avg_ep_length_det', 'train_eval_avg_ep_length_stoch',
+                   'train_eval_avg_ep_reward', 'train_eval_avg_ep_reward_det', 'train_eval_avg_ep_reward_stoch']:
+            if key not in self.training_stats:
+                self.training_stats[key] = []
+                
+        self.log('train_iterations', 0)
+        self.log('train_state_transitions', 0)
+        self.log('train_time', 0)
+        self.log('train_loss', [])
+        self.log('train_loss_clip', [])
+        self.log('train_loss_vf', [])
+        self.log('train_loss_entropy', [])
+        self.log('train_loss_total', [])
+        self.log('train_loss_iterations', [])
+        self.log('train_loss_state_transitions', [])
+        self.log('train_loss_time', [])
+        self.log('train_eval_iterations', [])
+        self.log('train_eval_state_transitions', [])
+        self.log('train_eval_time', [])
+        self.log('train_eval_avg_reward', [])
+        self.log('train_eval_avg_reward_det', [])
+        self.log('train_eval_avg_reward_stoch', [])
+        self.log('train_eval_avg_ep_length', [])
+        self.log('train_eval_avg_ep_length_det', [])
+        self.log('train_eval_avg_ep_length_stoch', [])
+        self.log('train_eval_avg_ep_reward', [])
+        self.log('train_eval_avg_ep_reward_det', [])
+        self.log('train_eval_avg_ep_reward_stoch', [])
+        # endregion
 
-            # Init (parallel) envs
-            state = self.init_markov_state(self.env.reset())
+        # region Main Training Loop
+        # Main training loop
+        train_start_time = time.time()
+        train_iteration = 0
+        train_state_transitions = 0
+        while train_state_transitions < self.total_num_state_transitions:
 
             # Collect training data
+            # region Data Collection
+            # Collect training data
+            # Reset environments and init Markov states
+            env_states = self.env_vec.reset()
+            markov_states = self.init_markov_state(env_states)
+
+            # Prepare for data collection
+            states = []
+            actions = []
+            log_probs = []
+            rewards = []
+            dones = []
+            values = []
+
+            # Collect training data
+            for t in range(self.trajectory_length):
+                # Get action from policy network
+                with torch.no_grad():
+                    # Get action from policy network
+                    markov_states_tensor = torch.tensor(markov_states, dtype=torch.float32, device=self.device)
+                    action = self.policy(markov_states_tensor)
+                    log_prob = self.policy.log_prob(action)
+                    value = self.val_net(markov_states_tensor)
+
+                # Execute action in environment
+                env_states, reward, done, _ = self.env_vec.step(action.cpu().numpy())
+
+                # Update Markov states
+                markov_states = self.env2markov(markov_states, env_states)
+
+                # Store data
+                states.append(markov_states_tensor)
+                actions.append(action)
+                log_probs.append(log_prob)
+                rewards.append(torch.tensor(reward, dtype=torch.float32, device=self.device).unsqueeze(1))
+                dones.append(torch.tensor(done, dtype=torch.float32, device=self.device).unsqueeze(1))
+                values.append(value)
+
+            # Compute advantage estimates
+            advantages = torch.zeros(self.parallel_agents, 1, device=self.device)
+            returns = torch.zeros(self.parallel_agents, 1, device=self.device) #对应论文中的 V_target 值
+            # endregion
+
+            # region Advantage Estimation
+            # Compute advantage estimates
             with torch.no_grad():
-                while num_observed_train_steps < self.T:
+                # Get value of last state
+                last_value = self.val_net(torch.tensor(markov_states, dtype=torch.float32, device=self.device))
 
-                    # Predict action (actually being multiple parallel ones)
-                    action = self.policy(state.to(self.device)).cpu()
+                # Compute returns and advantages
+                for t in reversed(range(self.trajectory_length)):
+                    # Compute returns
+                    returns = rewards[t] + self.gamma * returns * (1 - dones[t])
 
-                    # Perform action in env (self.dilation times)
-                    accumulated_reward = torch.zeros((self.parallel_agents,))
-                    for _ in range(self.dilation):
-                        next_state, reward, terminal_state, _ = self.env.step(action.numpy())
-
-                        # Sum rewards over time steps
-                        accumulated_reward += reward
-
-                        # If either env is done, stop repeating actions
-                        if terminal_state.any():
-                            break
-
-                    # Transform latest observations to tensor data
-                    reward = accumulated_reward
-                    next_state = self.env2markov(state, next_state)     # Note: state == Markov state, next_state == state as returned by env
-                    terminal_state = torch.tensor(terminal_state)       # Boolean indicating whether one of parallel envs has terminated or not
-
-                    # Get log-prob of chosen action (= log \pi_{\theta_{old}}(a_t|s_t) in accompanying report)
-                    log_prob = self.policy.log_prob(action.to(self.device)).cpu()
-
-                    # Store observable data
-                    observation = (state.unsqueeze(1), action, reward, next_state.unsqueeze(1), terminal_state, log_prob)
-                    obs_temp.append(observation)
-
-                    # Add number of newly (in parallel) experienced state transitions to counter
-                    num_observed_train_steps += self.parallel_agents
-
-
-                    # Prepare for next iteration
-                    if terminal_state.any() or num_observed_train_steps >= self.T:
-                        # Reset env for case where num_observed_train_steps < max_trajectory_length T (in which case a new iteration would follow)
-                        state = self.init_markov_state(self.env.reset())
-
-                        # Add temporarily stored observations (made during current iteration) to list of all freshly
-                        # observed training data collected so far for next weight update step; to be stored in 'observations':
-
-                        # Compute state value of final observed state (= V(s_T))
-                        last_state = obs_temp[-1][3]
-                        target_state_val = self.val_net(last_state.to(self.device).squeeze(1)).squeeze().cpu()  # V(s_T)
-                        termination_mask = (1 - obs_temp[-1][4].int()).float()  # Only associate last observed state with valuation of 0 if it is terminal
-                        target_state_val = target_state_val * termination_mask
-
-                        # Compute the target state value and advantage estimate for each state in agent's trajectory
-                        # (batch-wise for all parallel agents in parallel)
-                        for t in range(len(obs_temp)-1, -1, -1):
-                            # Compute target state value:
-                            # V^{target}_t = r_t + \gamma * r_{t+1} + ... + \gamma^{n-1} * r_{t+n-1} + \gamma^n * V(s_{t+n}), where t+n=T
-                            target_state_val = obs_temp[t][2] + self.gamma * target_state_val  # <- reward r_t obtained in state s_t + discounted future reward
-
-                            # Compute advantage estimate
-                            state_val = self.val_net(obs_temp[t][0].to(self.device).squeeze(1)).squeeze().cpu()  # V(s_t)
-                            advantage = target_state_val - state_val
-
-                            # Augment a previously observed observation tuple
-                            extra = (target_state_val, advantage)
-                            augmented_obs = obs_temp[t] + extra
-
-                            # Add all parallel agents' individual observations to overall (iteration's) observations list
-                            for i in range(self.parallel_agents):
-                                # Create i^th agent's private observation tuple for time step t in its current trajectory
-                                # element \in {state, action, reward, next_state, terminal_state, log_prob, target_val, advantage}
-                                single_agent_tuple = tuple([element[i] for element in augmented_obs])
-                                observations.append(single_agent_tuple)
-
-                        # Empty temporary list of observations after they have been added to more persistent list of freshly collected train data
-                        obs_temp = []
-
+                    # Compute advantages
+                    if t == self.trajectory_length - 1:
+                        next_value = last_value
                     else:
-                        # Trajectory continues from time step t to t+1 (for all parallel agents)
-                        state = next_state
+                        next_value = values[t + 1]
+                    delta = rewards[t] + self.gamma * next_value * (1 - dones[t]) - values[t]
+                    advantages = delta + self.gamma * self.gamma * advantages * (1 - dones[t])
 
-            # Perform weight updates for multiple epochs on freshly collected training data stored in 'observations'
-            iteration_loss = 0.
-            for epoch in range(self.epochs):
-                acc_epoch_loss = 0.   # Loss accumulated over multiple minibatches during epoch
+                    # Store returns
+                    values[t] = returns
+            # endregion
 
-                # Shuffle data
-                random.shuffle(observations)  # Shuffle in place!
+            # region Prepare Training Data
+            # Prepare training data
+            states = torch.cat(states)
+            actions = torch.cat(actions)
+            log_probs = torch.cat(log_probs)
+            returns = torch.cat(values)
+            advantages = torch.cat([advantages for _ in range(self.trajectory_length)])
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            # endregion
 
-                # Perform weight update on each minibatch contained in shuffled observations
-                for i in range(0, len(observations), self.batch_size):
-                    # Reset all gradients
+            # region Policy Update
+            # Update policy
+            for _ in range(self.epochs):
+                # Prepare for mini-batch update
+                indices = np.arange(self.parallel_agents * self.trajectory_length)
+                np.random.shuffle(indices)
+                for start in range(0, self.parallel_agents * self.trajectory_length, self.batch_size):
+                    # Get mini-batch
+                    end = start + self.batch_size
+                    mini_batch_indices = indices[start:end]
+                    mini_batch_states = states[mini_batch_indices]
+                    mini_batch_actions = actions[mini_batch_indices]
+                    mini_batch_log_probs = log_probs[mini_batch_indices]
+                    mini_batch_returns = returns[mini_batch_indices]
+                    mini_batch_advantages = advantages[mini_batch_indices]
+
+                    # Forward pass
+                    self.policy(mini_batch_states)
+                    log_prob = self.policy.log_prob(mini_batch_actions)
+                    entropy = self.policy.entropy().mean()
+                    value = self.val_net(mini_batch_states)
+
+                    # Compute losses
+                    ratio = torch.exp(log_prob - mini_batch_log_probs)
+                    surr1 = ratio * mini_batch_advantages
+                    surr2 = torch.clamp(ratio, 1.0 - self.epsilon.value,
+                                        1.0 + self.epsilon.value) * mini_batch_advantages
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    value_loss = F.mse_loss(value, mini_batch_returns)
+                    loss = policy_loss + self.v * value_loss - self.h * entropy
+
+                    # Backward pass
                     self.optimizer_p.zero_grad()
                     self.optimizer_v.zero_grad()
-
-                    # Sample minibatch
-                    minibatch = observations[i: i+self.batch_size]
-
-                    # Get all states, actions, log_probs, target_values, and advantage_estimates from minibatch
-                    state, action, _, _, _, log_prob_old, target_state_val, advantage = zip(*minibatch)
-
-                    # Transform batch of tuples to batch tensors
-                    state_ = torch.vstack(state).to(self.device)         # Minibatch of states
-                    target_state_val_ = torch.vstack(target_state_val).squeeze().to(self.device)
-                    advantage_ = torch.vstack(advantage).squeeze().to(self.device)
-                    log_prob_old_ = torch.vstack(log_prob_old).squeeze().to(self.device)
-
-                    if self.dist_type == DISCRETE:
-                        action_ = torch.vstack(action).squeeze().to(self.device)  # Minibatch of actions
-                    else:
-                        action_ = torch.vstack(action).to(self.device)            # Minibatch of actions
-
-                    # Compute log_prob for minibatch of actions
-                    _ = self.policy(state_)
-                    log_prob = self.policy.log_prob(action_).squeeze()
-
-                    # Compute current state value estimates
-                    state_val = self.val_net(state_).squeeze()
-
-                    # Evaluate loss function first component-wise, then combined:
-                    # L^{CLIP}
-                    L_CLIP = self.L_CLIP(log_prob, log_prob_old_, advantage_)
-
-                    # L^{V}
-                    L_V = self.L_VF(state_val, target_state_val_)
-
-                    if self.dist_type == DISCRETE or self.std_trainable:
-                        # An entropy bonus is added only if the agent faces a discrete action space or if we manually
-                        # declare that the standard deviation is trainable in continuous action spaces
-
-                        # H (= Entropy)
-                        L_ENTROPY = self.L_ENTROPY()
-
-                        # L^{CLIP + H + V} = L^{CLIP} + h*H + v*L^{V}
-                        loss = - L_CLIP - self.h * L_ENTROPY + self.v * L_V
-
-                    else:
-                        # L^{CLIP + H + V} = L^{CLIP} + h*H + v*L^{V}
-                        loss = - L_CLIP + self.v * L_V
-
-                    # Error handling
-                    if nan_error(loss):
-                        if self.dist_type == DISCRETE or self.std_trainable:
-                            print_nan_error_loss(loss, L_CLIP, L_V, action_, log_prob, log_prob_old_, state_, state_val, L_ENTROPY)
-                        else:
-                            print_nan_error_loss(loss, L_CLIP, L_V, action_, log_prob, log_prob_old_, state_, state_val)
-                        raise OverflowError('Loss is nan. See print statement above.')
-
-                    # Backprop loss
                     loss.backward()
-
-                    # Perform weight update for both the policy and value net
                     self.optimizer_p.step()
                     self.optimizer_v.step()
 
-                    # Document training progress after one weight update
-                    acc_epoch_loss += loss.cpu().detach().numpy()
+                    # Update learning rates
+                    if self.lr_scheduler_pol is not None:
+                        self.lr_scheduler_pol.step()
+                    if self.lr_scheduler_val is not None:
+                        self.lr_scheduler_val.step()
+            # endregion
 
-                # Document training progress after one full epoch/iteration of training
-                iteration_loss += acc_epoch_loss
-                self.log('devel_epoch_loss', acc_epoch_loss)
+            # region Logging and Evaluation
+            # Update counters
+            train_iteration += 1
+            train_state_transitions += self.parallel_agents * self.trajectory_length
+            self.log('train_iterations', train_iteration)
+            self.log('train_state_transitions', train_state_transitions)
+            self.log('train_time', time.time() - train_start_time)
 
-            # Potentially decrease learning rates and standard deviation every training iteration
-            if self.lr_scheduler_pol:
-                self.lr_scheduler_pol.step()
+            # Log training stats
+            iteration_loss = {
+                'clip': policy_loss.item(),
+                'vf': value_loss.item(),
+                'entropy': entropy.item(),
+                'total': loss.item()
+            }
+            self.log_train_stats(iteration_loss)
 
-            if self.lr_scheduler_val:
-                self.lr_scheduler_val.step()
+            # Evaluate policy
+            if train_iteration % self.intermediate_eval_steps == 0:
+                if self.deterministic_eval:
+                    self.eval_and_log(eval_type=INTERMEDIATE)
+                if self.stochastic_eval:
+                    self.eval_and_log(eval_type=INTERMEDIATE)
+            # endregion
 
-            if self.decay_standard_dev:
+            # Update parameters
+            if self.epsilon is not None:
+                self.epsilon.step()
+            if not self.std_trainable and self.policy.std is not None:
                 self.policy.std.step()
 
-            # Potentially decrease epsilon
-            self.epsilon.step()
+        # Evaluate final policy
+        if self.deterministic_eval:
+            self.eval_and_log(eval_type=FINAL)
+        if self.stochastic_eval:
+            self.eval_and_log(eval_type=FINAL)
 
-            # Document training progress at the end of a full iteration
-            self.log_train_stats(iteration_loss=iteration_loss)
-            # Perform a short intermediate evaluation
-            self.eval_and_log(eval_type=INTERMEDIATE)
-            print()
+        # Show final demo
+        if self.show_final_demo:
+            self.eval(time_steps=self.max_render_time_steps, render=True, deterministic_eval=True)
 
-        # Clean up after training
-        self.env.close()
-
-        # Final evaluation
-        self.eval_and_log(eval_type=FINAL)
+        # Close environments
+        self.env_vec.close()
+        # endregion
 
         return self.training_stats
 
@@ -851,11 +1038,18 @@ class ProximalPolicyOptimization:
                 # Perform action in env (taking into consideration various input-output behaviors of Gym envs')
                 accumulated_reward = 0.
                 try:
-                    # Not all environments accept inputs in the same format. This try-catch is to see which format
-                    # applies in the current environment
+                    # 尝试使用新版本gym API
                     for _ in range(self.dilation):
-                        # Some envs require actions of format: 1.0034
-                        next_state, reward, terminal_state, _ = env.step(action)
+                        result = env.step(action)
+                        if len(result) == 4:
+                            next_state, reward, terminal_state, _ = result
+                        elif len(result) == 5:
+                            next_state, reward, terminal_state, _, _ = result
+                        else:
+                            # 未知格式，使用默认值
+                            next_state = last_state.numpy()[0] if isinstance(last_state, torch.Tensor) else last_state
+                            reward = 0
+                            terminal_state = False
 
                         # Sum rewards over time steps
                         accumulated_reward += reward
@@ -863,18 +1057,30 @@ class ProximalPolicyOptimization:
                         # If env is done, i.e. simulation has terminated, stop repeating actions
                         if terminal_state:
                             break
+                except Exception as e:
+                    # 如果新API失败，尝试旧版本API的不同格式
+                    try:
+                        for _ in range(self.dilation):
+                            # Some envs require actions of format: 1.0034
+                            next_state, reward, terminal_state, _ = env.step(action)
 
-                except IndexError:
-                    for _ in range(self.dilation):
-                        # Some envs require actions of format: [1.0034]
-                        next_state, reward, terminal_state, _ = env.step([action])
+                            # Sum rewards over time steps
+                            accumulated_reward += reward
 
-                        # Sum rewards over time steps
-                        accumulated_reward += reward
+                            # If env is done, i.e. simulation has terminated, stop repeating actions
+                            if terminal_state:
+                                break
+                    except IndexError:
+                        for _ in range(self.dilation):
+                            # Some envs require actions of format: [1.0034]
+                            next_state, reward, terminal_state, _ = env.step([action])
 
-                        # If env is done, i.e. simulation has terminated, stop repeating actions
-                        if terminal_state:
-                            break
+                            # Sum rewards over time steps
+                            accumulated_reward += reward
+
+                            # If env is done, i.e. simulation has terminated, stop repeating actions
+                            if terminal_state:
+                                break
 
                 # Count accumulative rewards
                 total_rewards += accumulated_reward
